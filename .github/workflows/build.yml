@@ -1,0 +1,221 @@
+name: Build JupiterX (Photon Bots)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jupiterx-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  CONFIGURATION: Release
+
+jobs:
+  build:
+    name: Unzip + build net48
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            6.0.x
+
+      - name: Install .NET Framework 4.8 targeting pack
+        shell: pwsh
+        run: |
+          $tp = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
+          if (-not (Test-Path $tp)) {
+            Write-Host "Installing net48 developer pack via chocolatey fallback..."
+            choco install netfx-4.8-devpack -y --no-progress
+          } else {
+            Write-Host "Found net48 targeting pack at $tp"
+          }
+
+      - name: Find and extract zip(s)
+        id: extract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = Join-Path $env:RUNNER_TEMP "jupiterx-src"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          # Any .zip at repo root or one level deep (skip .git)
+          $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter *.zip -File |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
+            Sort-Object { $_.Name -notmatch 'LemonLoader|References|refs' }, Length -Descending
+
+          if (-not $zips -or $zips.Count -eq 0) {
+            Write-Error "No .zip files found in the repository."
+            exit 1
+          }
+
+          Write-Host "Found $($zips.Count) zip(s):"
+          $zips | ForEach-Object { Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1MB,2)) MB)" }
+
+          # Extract every zip into work (later ones can overlay)
+          foreach ($z in $zips) {
+            Write-Host "Extracting $($z.Name) ..."
+            Expand-Archive -Path $z.FullName -DestinationPath $work -Force
+          }
+
+          # Prefer a tree that already has JupiterX.csproj
+          $csproj = Get-ChildItem -Path $work -Recurse -Filter JupiterX.csproj -File |
+            Select-Object -First 1
+
+          if (-not $csproj) {
+            Write-Host "Tree under $work :"
+            Get-ChildItem $work -Recurse -Depth 3 | Select-Object -First 80 FullName
+            Write-Error "No JupiterX.csproj found after extracting zip(s)."
+            exit 1
+          }
+
+          $projectDir = $csproj.Directory.FullName
+          Write-Host "Project dir: $projectDir"
+          Write-Host "csproj: $($csproj.FullName)"
+
+          "project_dir=$projectDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "csproj=$($csproj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "work=$work" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Ensure reference DLLs (bin/Debug)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = "${{ steps.extract.outputs.project_dir }}"
+          $work = "${{ steps.extract.outputs.work }}"
+          $binDebug = Join-Path $projectDir "bin\Debug"
+          New-Item -ItemType Directory -Force -Path $binDebug | Out-Null
+
+          $count = (Get-ChildItem $binDebug -Filter *.dll -ErrorAction SilentlyContinue | Measure-Object).Count
+          Write-Host "bin/Debug DLL count before fill: $count"
+
+          if ($count -lt 50) {
+            # Pull DLLs from any extracted LemonLoader / references folder
+            $refDirs = Get-ChildItem -Path $work -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -match 'LemonLoader|References|refs' -or
+                (Test-Path (Join-Path $_.FullName "MelonLoader.dll"))
+              }
+
+            foreach ($d in $refDirs) {
+              Write-Host "Copying refs from $($d.FullName)"
+              Get-ChildItem $d.FullName -Filter *.dll -File | ForEach-Object {
+                Copy-Item $_.FullName -Destination $binDebug -Force
+              }
+            }
+
+            # Also: loose MelonLoader.dll anywhere under work
+            Get-ChildItem -Path $work -Recurse -Filter MelonLoader.dll -File -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                $srcDir = $_.Directory.FullName
+                Write-Host "Copying sibling DLLs from $srcDir"
+                Get-ChildItem $srcDir -Filter *.dll -File | ForEach-Object {
+                  Copy-Item $_.FullName -Destination $binDebug -Force
+                }
+              }
+          }
+
+          $count = (Get-ChildItem $binDebug -Filter *.dll | Measure-Object).Count
+          Write-Host "bin/Debug DLL count after fill: $count"
+
+          $required = @(
+            "Assembly-CSharp.dll",
+            "MelonLoader.dll",
+            "0Harmony.dll",
+            "UnityEngine.CoreModule.dll",
+            "PhotonUnityNetworking.dll",
+            "UnhollowerBaseLib.dll"
+          )
+          $missing = @()
+          foreach ($r in $required) {
+            if (-not (Test-Path (Join-Path $binDebug $r))) { $missing += $r }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Missing required reference(s): $($missing -join ', '). Put LemonLoaderReferences zip in the repo too."
+            exit 1
+          }
+          if ($count -lt 50) {
+            Write-Error "Only $count DLLs in bin/Debug after fill — expected ~130+."
+            exit 1
+          }
+          Write-Host "Core references OK ($count DLLs)"
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.extract.outputs.csproj }}"
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          dotnet build "${{ steps.extract.outputs.csproj }}" -c $env:CONFIGURATION --no-restore -p:WarningLevel=0 -v:m
+
+      - name: Locate output DLL
+        id: out
+        shell: pwsh
+        run: |
+          $projectDir = "${{ steps.extract.outputs.project_dir }}"
+          $candidates = @(
+            (Join-Path $projectDir "bin\Release\JupiterX.dll"),
+            (Join-Path $projectDir "bin\Release\net48\JupiterX.dll")
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
+          }
+          if (-not $found) {
+            Write-Host "Search tree:"
+            Get-ChildItem -Path $projectDir -Recurse -Filter JupiterX.dll -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+            Write-Error "JupiterX.dll not found after build"
+            exit 1
+          }
+          $item = Get-Item $found
+          Write-Host "Built: $($item.FullName) ($([math]::Round($item.Length/1KB,1)) KB)"
+          "dll=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "size=$($item.Length)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "${{ steps.out.outputs.dll }}" dist/JupiterX.dll
+          @"
+          JupiterX — Photon Bots only
+          Drop JupiterX.dll into your MelonLoader Mods folder.
+          Built by GitHub Actions on $($env:GITHUB_SHA.Substring(0,7))
+          "@ | Set-Content dist/README.txt
+
+      - name: Upload JupiterX.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: JupiterX-PhotonBots-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          @"
+          ### JupiterX build
+          - Source: unzipped repo .zip file(s)
+          - Configuration: `${{ env.CONFIGURATION }}`
+          - DLL: `${{ steps.out.outputs.dll }}`
+          - Size: $([math]::Round(${{ steps.out.outputs.size }}/1KB, 1)) KB
+          - Artifact: `JupiterX-PhotonBots-${{ github.sha }}`
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
