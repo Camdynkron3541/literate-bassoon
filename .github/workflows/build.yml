@@ -1,4 +1,4 @@
-name: Build JupiterX (Photon Bots)
+name: Build Mountains Bets (JX Menu)
 
 on:
   push:
@@ -10,212 +10,222 @@ permissions:
   contents: read
 
 concurrency:
-  group: jupiterx-${{ github.ref }}
+  group: mountainsbets-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   CONFIGURATION: Release
 
 jobs:
   build:
-    name: Unzip + build net48
-    runs-on: windows-latest
+    name: Unzip + build netstandard2.1
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET SDK
+      - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: |
-            8.0.x
-            6.0.x
+          dotnet-version: 8.0.x
 
-      - name: Install .NET Framework 4.8 targeting pack
-        shell: pwsh
-        run: |
-          $tp = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8"
-          if (-not (Test-Path $tp)) {
-            Write-Host "Installing net48 developer pack via chocolatey fallback..."
-            choco install netfx-4.8-devpack -y --no-progress
-          } else {
-            Write-Host "Found net48 targeting pack at $tp"
-          }
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-mbt-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-mbt-
+            nuget-${{ runner.os }}-
 
       - name: Find and extract zip(s)
         id: extract
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $work = Join-Path $env:RUNNER_TEMP "jupiterx-src"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          set -euo pipefail
+          WORK="${RUNNER_TEMP}/mbt-src"
+          mkdir -p "$WORK"
 
-          # Any .zip at repo root or one level deep (skip .git)
-          $zips = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter *.zip -File |
-            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
-            Sort-Object { $_.Name -notmatch 'LemonLoader|References|refs' }, Length -Descending
+          mapfile -t ZIPS < <(find "$GITHUB_WORKSPACE" -type f -name '*.zip' ! -path '*/.git/*' | sort)
+          if [ ${#ZIPS[@]} -eq 0 ]; then
+            # also allow already-unpacked tree in repo
+            if find "$GITHUB_WORKSPACE" -name 'StupidTemplate.csproj' | grep -q .; then
+              echo "No zips; using checked-out tree"
+              WORK="$GITHUB_WORKSPACE"
+            else
+              echo "No .zip files and no StupidTemplate.csproj in the repository."
+              exit 1
+            fi
+          else
+            echo "Found ${#ZIPS[@]} zip(s):"
+            for z in "${ZIPS[@]}"; do
+              echo "  $z ($(du -h "$z" | cut -f1))"
+              unzip -qo "$z" -d "$WORK"
+            done
+          fi
 
-          if (-not $zips -or $zips.Count -eq 0) {
-            Write-Error "No .zip files found in the repository."
+          CSPROJ=$(find "$WORK" -type f -name 'StupidTemplate.csproj' | head -n1)
+          if [ -z "$CSPROJ" ]; then
+            CSPROJ=$(find "$WORK" -type f -name '*.csproj' ! -name '*Test*' | head -n1)
+          fi
+          if [ -z "$CSPROJ" ]; then
+            echo "Tree under $WORK:"
+            find "$WORK" -maxdepth 4 -type f | head -80
+            echo "No StupidTemplate.csproj found."
             exit 1
-          }
+          fi
 
-          Write-Host "Found $($zips.Count) zip(s):"
-          $zips | ForEach-Object { Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1MB,2)) MB)" }
+          PROJECT_DIR=$(dirname "$CSPROJ")
+          {
+            echo "project_dir=$PROJECT_DIR"
+            echo "csproj=$CSPROJ"
+            echo "work=$WORK"
+          } >> "$GITHUB_OUTPUT"
+          echo "Project dir: $PROJECT_DIR"
+          echo "csproj: $CSPROJ"
 
-          # Extract every zip into work (later ones can overlay)
-          foreach ($z in $zips) {
-            Write-Host "Extracting $($z.Name) ..."
-            Expand-Archive -Path $z.FullName -DestinationPath $work -Force
-          }
-
-          # Prefer a tree that already has JupiterX.csproj
-          $csproj = Get-ChildItem -Path $work -Recurse -Filter JupiterX.csproj -File |
-            Select-Object -First 1
-
-          if (-not $csproj) {
-            Write-Host "Tree under $work :"
-            Get-ChildItem $work -Recurse -Depth 3 | Select-Object -First 80 FullName
-            Write-Error "No JupiterX.csproj found after extracting zip(s)."
-            exit 1
-          }
-
-          $projectDir = $csproj.Directory.FullName
-          Write-Host "Project dir: $projectDir"
-          Write-Host "csproj: $($csproj.FullName)"
-
-          "project_dir=$projectDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "csproj=$($csproj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "work=$work" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Ensure reference DLLs (bin/Debug)
-        shell: pwsh
+      - name: Resolve references
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $projectDir = "${{ steps.extract.outputs.project_dir }}"
-          $work = "${{ steps.extract.outputs.work }}"
-          $binDebug = Join-Path $projectDir "bin\Debug"
-          New-Item -ItemType Directory -Force -Path $binDebug | Out-Null
+          set -euo pipefail
+          WORK="${{ steps.extract.outputs.work }}"
+          PROJECT_DIR="${{ steps.extract.outputs.project_dir }}"
 
-          $count = (Get-ChildItem $binDebug -Filter *.dll -ErrorAction SilentlyContinue | Measure-Object).Count
-          Write-Host "bin/Debug DLL count before fill: $count"
+          # Prefer bundled References/ next to the csproj (shipped in the template zip)
+          LOCAL_MANAGED="$PROJECT_DIR/References/Managed"
+          LOCAL_BEPINEX="$PROJECT_DIR/References/BepInEx/core"
 
-          if ($count -lt 50) {
-            # Pull DLLs from any extracted LemonLoader / references folder
-            $refDirs = Get-ChildItem -Path $work -Directory -Recurse -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -match 'LemonLoader|References|refs' -or
-                (Test-Path (Join-Path $_.FullName "MelonLoader.dll"))
-              }
+          if [ -d "$LOCAL_MANAGED" ] && [ -f "$LOCAL_MANAGED/Assembly-CSharp.dll" ]; then
+            echo "Using bundled References/ from template"
+            MANAGED="$LOCAL_MANAGED"
+            BEPINEX="$LOCAL_BEPINEX"
+            mkdir -p "$BEPINEX"
+          else
+            echo "No bundled References — staging from extracted DLLs"
+            REFS="$WORK/_refs"
+            MANAGED="$REFS/Managed"
+            BEPINEX="$REFS/BepInEx/core"
+            mkdir -p "$MANAGED" "$BEPINEX"
+            BEPINEX_NAMES='^(0Harmony|BepInEx|HarmonyXInterop|Mono\.Cecil|MonoMod\.)'
+            while IFS= read -r -d '' dll; do
+              base=$(basename "$dll")
+              if echo "$base" | grep -Eq "$BEPINEX_NAMES"; then
+                cp -n "$dll" "$BEPINEX/" 2>/dev/null || true
+              else
+                cp -n "$dll" "$MANAGED/" 2>/dev/null || true
+              fi
+            done < <(find "$WORK" -type f -name '*.dll' ! -path '*/_refs/*' -print0)
+          fi
 
-            foreach ($d in $refDirs) {
-              Write-Host "Copying refs from $($d.FullName)"
-              Get-ChildItem $d.FullName -Filter *.dll -File | ForEach-Object {
-                Copy-Item $_.FullName -Destination $binDebug -Force
-              }
-            }
+          echo "Managed: $(find "$MANAGED" -name '*.dll' | wc -l) DLLs"
+          echo "BepInEx core: $(find "$BEPINEX" -name '*.dll' 2>/dev/null | wc -l) DLLs"
 
-            # Also: loose MelonLoader.dll anywhere under work
-            Get-ChildItem -Path $work -Recurse -Filter MelonLoader.dll -File -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                $srcDir = $_.Directory.FullName
-                Write-Host "Copying sibling DLLs from $srcDir"
-                Get-ChildItem $srcDir -Filter *.dll -File | ForEach-Object {
-                  Copy-Item $_.FullName -Destination $binDebug -Force
-                }
-              }
-          }
-
-          $count = (Get-ChildItem $binDebug -Filter *.dll | Measure-Object).Count
-          Write-Host "bin/Debug DLL count after fill: $count"
-
-          $required = @(
-            "Assembly-CSharp.dll",
-            "MelonLoader.dll",
-            "0Harmony.dll",
-            "UnityEngine.CoreModule.dll",
-            "PhotonUnityNetworking.dll",
-            "UnhollowerBaseLib.dll"
-          )
-          $missing = @()
-          foreach ($r in $required) {
-            if (-not (Test-Path (Join-Path $binDebug $r))) { $missing += $r }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Error "Missing required reference(s): $($missing -join ', '). Put LemonLoaderReferences zip in the repo too."
+          NEED=(Assembly-CSharp.dll UnityEngine.CoreModule.dll BepInEx.dll 0Harmony.dll)
+          MISSING=()
+          for r in "${NEED[@]}"; do
+            if [ ! -f "$MANAGED/$r" ] && [ ! -f "$BEPINEX/$r" ]; then
+              MISSING+=("$r")
+            fi
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "Missing: ${MISSING[*]}"
+            ls "$MANAGED" | head -30
+            ls "$BEPINEX" 2>/dev/null || true
             exit 1
-          }
-          if ($count -lt 50) {
-            Write-Error "Only $count DLLs in bin/Debug after fill — expected ~130+."
-            exit 1
-          }
-          Write-Host "Core references OK ($count DLLs)"
+          fi
 
-      - name: Restore NuGet packages
-        shell: pwsh
-        run: |
-          dotnet restore "${{ steps.extract.outputs.csproj }}"
+          # Force props at project root so HintPaths resolve (even if Exists() is flaky on runner)
+          cat > "$PROJECT_DIR/Directory.Build.props" << EOF
+          <?xml version="1.0" encoding="utf-8" ?>
+          <Project>
+            <PropertyGroup>
+              <GamePath>$PROJECT_DIR/References</GamePath>
+              <GameAssemblyPath>$MANAGED</GameAssemblyPath>
+              <BepInExAssemblyPath>$BEPINEX</BepInExAssemblyPath>
+              <PluginsPath>$PROJECT_DIR/References/BepInEx/plugins</PluginsPath>
+            </PropertyGroup>
+          </Project>
+          EOF
+          sed -i 's/^          //' "$PROJECT_DIR/Directory.Build.props"
+          cat "$PROJECT_DIR/Directory.Build.props"
+
+      - name: Restore
+        run: dotnet restore "${{ steps.extract.outputs.csproj }}" --verbosity minimal
 
       - name: Build Release
-        shell: pwsh
         run: |
-          dotnet build "${{ steps.extract.outputs.csproj }}" -c $env:CONFIGURATION --no-restore -p:WarningLevel=0 -v:m
+          dotnet build "${{ steps.extract.outputs.csproj }}" \
+            -c "$CONFIGURATION" \
+            --no-restore \
+            -p:WarningLevel=0 \
+            -p:TreatWarningsAsErrors=false \
+            -v:m
 
       - name: Locate output DLL
         id: out
-        shell: pwsh
+        shell: bash
         run: |
-          $projectDir = "${{ steps.extract.outputs.project_dir }}"
-          $candidates = @(
-            (Join-Path $projectDir "bin\Release\JupiterX.dll"),
-            (Join-Path $projectDir "bin\Release\net48\JupiterX.dll")
-          )
-          $found = $null
-          foreach ($c in $candidates) {
-            if (Test-Path $c) { $found = $c; break }
-          }
-          if (-not $found) {
-            Write-Host "Search tree:"
-            Get-ChildItem -Path $projectDir -Recurse -Filter JupiterX.dll -ErrorAction SilentlyContinue |
-              ForEach-Object { $_.FullName }
-            Write-Error "JupiterX.dll not found after build"
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.extract.outputs.project_dir }}"
+          FOUND=""
+          for c in \
+            "$PROJECT_DIR/bin/Release/netstandard2.1/StupidTemplate.dll" \
+            "$PROJECT_DIR/bin/Release/StupidTemplate.dll" \
+            "$PROJECT_DIR/bin/Release/netstandard2.1/MountainsBets.dll"
+          do
+            [ -f "$c" ] && FOUND="$c" && break
+          done
+          if [ -z "$FOUND" ]; then
+            FOUND=$(find "$PROJECT_DIR/bin" -type f -name '*.dll' \
+              ! -name 'System.*' ! -name 'Microsoft.*' ! -name 'netstandard.dll' \
+              2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$FOUND" ] || [ ! -f "$FOUND" ]; then
+            find "$PROJECT_DIR" -name '*.dll' 2>/dev/null | head -40
+            echo "DLL not found after build"
             exit 1
-          }
-          $item = Get-Item $found
-          Write-Host "Built: $($item.FullName) ($([math]::Round($item.Length/1KB,1)) KB)"
-          "dll=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "size=$($item.Length)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          fi
+          SIZE=$(stat -c%s "$FOUND")
+          echo "Built: $FOUND ($(( SIZE / 1024 )) KB)"
+          echo "dll=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$FOUND")" >> "$GITHUB_OUTPUT"
 
       - name: Stage artifact
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "${{ steps.out.outputs.dll }}" dist/JupiterX.dll
-          @"
-          JupiterX — Photon Bots only
-          Drop JupiterX.dll into your MelonLoader Mods folder.
-          Built by GitHub Actions on $($env:GITHUB_SHA.Substring(0,7))
-          "@ | Set-Content dist/README.txt
+          mkdir -p dist
+          cp "${{ steps.out.outputs.dll }}" "dist/${{ steps.out.outputs.name }}"
+          cat > dist/README.txt << EOF
+          Mountains Bets — JX MODDING GAME PCVR menu
+          Unity 2021.3.21 / BepInEx / netstandard2.1
 
-      - name: Upload JupiterX.dll
+          Drop ${{ steps.out.outputs.name }} into:
+            .../jxmoddinggame/BepInEx/plugins/
+
+          Built by GitHub Actions on ${GITHUB_SHA:0:7}
+          EOF
+
+      - name: Upload plugin DLL
         uses: actions/upload-artifact@v4
         with:
-          name: JupiterX-PhotonBots-${{ github.sha }}
+          name: MountainsBets-JX-${{ github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 14
 
       - name: Summary
-        shell: pwsh
+        shell: bash
         run: |
-          @"
-          ### JupiterX build
-          - Source: unzipped repo .zip file(s)
-          - Configuration: `${{ env.CONFIGURATION }}`
-          - DLL: `${{ steps.out.outputs.dll }}`
-          - Size: $([math]::Round(${{ steps.out.outputs.size }}/1KB, 1)) KB
-          - Artifact: `JupiterX-PhotonBots-${{ github.sha }}`
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ### Mountains Bets build
+          - Source: StupidTemplate + bundled References (UnitySubsystems + BepInEx core)
+          - Target: netstandard2.1
+          - DLL: \`${{ steps.out.outputs.name }}\`
+          - Size: $(( ${{ steps.out.outputs.size }} / 1024 )) KB
+          - Artifact: \`MountainsBets-JX-${{ github.sha }}\`
+          EOF
